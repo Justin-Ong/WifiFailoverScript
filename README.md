@@ -169,6 +169,134 @@ effectiveThreshold = max($minJitterThreshold, baselineJitter × $jitterMultiplie
 
 If either jitter or trend crosses its threshold, the link is flagged as "degraded". When degraded, the predictive swap uses `$degradationProbThreshold` instead of `$swapProbThreshold`, allowing earlier swapping based on the CDF.
 
+## Reading the Console Output
+
+### Startup Banner
+
+When the script launches, it prints a banner showing your configuration:
+
+```
+==========================================
+  WiFi Failover Watchdog + Prediction
+==========================================
+Primary:     Wi-Fi 2
+Secondary:   Wi-Fi 3
+Ping mode:   ping.exe -S (async background threads)
+Threshold:   200ms | Failover: 1 | Recovery: 10
+Prediction:  CDF swap=65% return=P90 maxhold=180s
+Bounce:      8s min stable (adaptive) | Jitter: 2.5x baseline (floor 15ms) | Trend: 5ms/tick
+Cluster:     120s gap | 2x hold | 300s cooldown
+Min data:    3 disconnects before prediction
+Max log:     500 entries | Max intervals: 500
+Log file:    C:\...\disconnect_log.csv
+Press Ctrl+C to stop
+===========================================
+```
+
+Check that the adapter names and parameters match what you expect before the main loop begins.
+
+### Status Line
+
+Each tick (~0.5s) prints a single status line:
+
+```
+[14:30:15] P=4ms(312s) S=8ms(312s) Act=Wi-Fi 2 Total=312s [P=72% elapsed=312s]
+```
+
+| Segment | Meaning |
+|---|---|
+| `[14:30:15]` | Current timestamp (HH:mm:ss) |
+| `P=4ms(312s)` | **Primary** adapter: latency in ms, uptime in parentheses. Green = healthy, Red = degraded or down |
+| `S=8ms(312s)` | **Secondary** adapter: same format. Green = healthy, Red = degraded or down |
+| `Act=Wi-Fi 2` | Which adapter is currently **active** (routing traffic) |
+| `Total=312s` | Total script uptime since launch |
+| `[P=72% elapsed=312s]` | **Prediction**: CDF probability of disconnect at current elapsed time, and seconds since primary became healthy |
+
+When the adapter is down, the latency is replaced with a down timer:
+
+```
+P=DOWN(5s) S=8ms(120s) ...
+```
+
+When the prediction engine is still learning (fewer than `$minDataPoints` disconnects recorded), the prediction field shows:
+
+```
+[Learning (2 more)]
+```
+
+Once enough data is collected but `$predictionBaseTime` hasn't been set yet (e.g. primary is on secondary), it shows:
+
+```
+[Waiting]
+```
+
+### Cluster Indicators
+
+Cluster state is appended to the status line:
+
+- **`[CLUSTER x5]`** — Active cluster detected; 5 disconnects in the current burst. The script is holding on secondary with extended thresholds.
+- **`[POST-CLUSTER 180s]`** — Cluster ended, 180 seconds remaining in the cooldown period. Intermediate recovery thresholds are still in effect.
+
+### Degradation Warning
+
+When primary is the active adapter and link degradation is detected, a yellow warning line appears below the status line:
+
+```
+  [DEGRADED jitter=32.5ms(thr=22.0ms) trend=3.12ms/tick]
+```
+
+- **jitter** — Current standard deviation of latencies in the sliding window.
+- **thr** — The adaptive jitter threshold (`max($minJitterThreshold, baselineJitter × $jitterMultiplier)`).
+- **trend** — Linear regression slope of recent latencies (ms per tick). Positive = latency rising.
+
+When this line appears, the script is using the lower `$degradationProbThreshold` for predictive swaps.
+
+### Swap and Failover Events
+
+Event messages appear below the status line when the script changes adapters:
+
+| Message | Color | Meaning |
+|---|---|---|
+| `REACTIVE FAILOVER -> Wi-Fi 3` | Magenta | Primary failed health checks; emergency switch to secondary (bypasses cooldown) |
+| `PREDICTIVE SWAP -> Wi-Fi 3 (predictive P=72%)` | Blue | CDF probability crossed the swap threshold; pre-emptive switch |
+| `PREDICTIVE SWAP -> Wi-Fi 3 (predictive+degraded P=45%)` | Blue | Same, but triggered at the lower degradation threshold |
+| `FAILBACK -> Wi-Fi 2 (primary recovered)` | Magenta | Primary passed enough consecutive recovery checks; returning |
+| `FAILBACK -> Wi-Fi 2 (secondary degraded)` | Magenta | Secondary failed; forced return to primary |
+| `PREDICTIVE RETURN -> Wi-Fi 2 (disconnect window passed)` | Blue | Elapsed time exceeded the return-hold percentile; returning to primary |
+| `PREDICTIVE RETURN -> Wi-Fi 2 (max hold time)` | Blue | Hard timeout reached while on secondary |
+| `PREDICTIVE RETURN -> Wi-Fi 2 (max hold time (cluster))` | Blue | Hard timeout reached during a cluster (extended hold) |
+| `>>> ACTIVE: Wi-Fi 2 (reason) <<<` | Green | Confirms the adapter switch succeeded |
+
+### Disconnect Logging Messages
+
+When a disconnect is recorded:
+
+```
+  LOGGED | Count: 47 | Avg: 312s | Min: 45s | Max: 920s
+```
+
+This shows updated interval statistics after the new entry. If the interval was too short (bounce filtered):
+
+```
+  (bounce: 3s < 8s threshold, skipping)
+```
+
+### Other Messages
+
+| Message | Color | Meaning |
+|---|---|---|
+| `[CLUSTER DETECTED: 3 disconnects in rapid succession]` | Yellow | Two or more disconnects within `$clusterGapThreshold` — cluster mode activated |
+| `[CLUSTER ENDED after 5 disconnects]` | DarkYellow | Gap between disconnects exceeded threshold — cluster over, cooldown begins |
+| `Swap to Wi-Fi 3 suppressed (cooldown)` | Gray | A non-forced swap was blocked by the cooldown timer |
+| `Swap to Wi-Fi 3 FAILED (metric change error)` | Red | `Set-NetIPInterface` failed — check adapter availability |
+| `Failed to set metric for Wi-Fi 2 : ...` | Red | Initial metric setup error at startup |
+| `Skipping malformed log row: ...` | Yellow | A corrupted CSV line was skipped during log bootstrap |
+| `Loaded 47 previous disconnect intervals.` | Gray | Startup: historical intervals loaded from CSV |
+| `Warning: no valid rows found in log, starting fresh` | Yellow | Startup: CSV existed but had no parseable data |
+| `Shutting down...` | Yellow | Ctrl+C pressed; cleanup in progress |
+| `Restored automatic metrics on Wi-Fi 2 and Wi-Fi 3` | Gray | Metrics restored to automatic on exit |
+| `Cleanup complete.` | Green | All resources released; safe to close the window |
+
 ## Logging
 
 Disconnects are appended to `disconnect_log.csv` in the script directory:
@@ -196,6 +324,7 @@ Each row captures the CDF probability at the moment of disconnect, the link degr
 | `$previousTickHealthy` | Last tick's health state — detects healthy→unhealthy transitions for centralized disconnect logging |
 | `$primaryHealthySince` | When current healthy streak began (bounce filtering for disconnect logging and prediction base anchoring) |
 | `$predictionBaseTime` | Anchor for "time since primary became healthy" (debounced). Nulled by `Write-DisconnectLog` |
+| `$lastDisconnectTime` | Timestamp of last logged disconnect (fallback for first interval calculation) |
 | `$latencyWindow` | Sliding window of recent primary latencies for degradation analysis |
 | `$baselineLatencyWindow` | Long-term latency baseline for relative degradation thresholds |
 | `$inCluster` | Whether currently in a disconnect burst |
