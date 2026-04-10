@@ -15,15 +15,21 @@ $badMetric = 500
 $logFile = "$PSScriptRoot\disconnect_log.csv"
 $maxLogLines = 500             # cap log file size
 $maxIntervals = 500            # cap in-memory interval list
-$safetyMarginPct = 0.15        # swap this % before predicted disconnect (15%)
-$emaAlpha = 0.3                # EMA weight: higher = more reactive to recent data
+$swapProbThreshold = 0.65      # swap when this fraction of historical disconnects would have already occurred
+$returnHoldPctile = 0.90       # stay on secondary until elapsed time exceeds this percentile of intervals
+$maxHoldTime = 180             # hard ceiling on secondary hold time (seconds)
+$degradationProbThreshold = 0.40 # lower swap threshold when link degradation is detected
 $minDataPoints = 3             # minimum disconnects before enabling prediction
 $staleProbeThreshold = 10      # seconds — treat probe as down if Updated is older than this
-$minStableInterval = 8         # seconds — intervals shorter than this are bounces (excluded from EMA)
+$minStableIntervalFloor = 8    # absolute minimum — adaptive threshold won't go below this
 $latencyWindowSize = 20        # sliding window size for degradation detection
-$jitterThreshold = 50          # ms stddev — above this, link is "jittery"
+$baselineWindowSize = 100      # sliding window size for long-term baseline
+$jitterMultiplier = 2.5        # flag degradation when current jitter exceeds baseline * this
+$minJitterThreshold = 15       # ms — absolute floor for jitter threshold (prevents triggering on noise when baseline is very low)
 $trendThreshold = 5            # ms/sample slope — positive slope = worsening latency
-$degradationLookaheadPct = 0.30 # trigger early swap if within this % of predicted disconnect AND degraded
+$clusterGapThreshold = 120     # seconds — disconnects closer than this are part of the same cluster
+$clusterHoldMultiplier = 2.0   # multiply return hold time when in a cluster
+$clusterCooldownInterval = 300 # seconds — after a cluster ends, wait this long before trusting primary fully
 
 # --- Validate environment ---
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -52,9 +58,7 @@ $activeAdapter = $primary
 $lastDisconnectTime = $null
 $predictionBaseTime = $null     # when to base next prediction from (may differ from lastDisconnectTime after false positives)
 $intervals = [System.Collections.Generic.List[double]]::new()
-$emaInterval = $null
 $predictivelySwapped = $false
-$savedPredictDisconnectAt = $null
 $primaryUpSince = Get-Date
 $secondaryUpSince = Get-Date
 $primaryDownSince = $null
@@ -64,9 +68,13 @@ $primaryWasHealthy = $false     # track primary unhealthy→healthy transitions 
 $previousTickHealthy = $false   # last tick's health state — used to detect healthy→unhealthy transitions for disconnect logging
 $primaryHealthySince = $null    # when current healthy streak began (bounce filtering)
 $latencyWindow = [System.Collections.Generic.List[double]]::new()  # sliding window for degradation detection
+$baselineLatencyWindow = [System.Collections.Generic.List[double]]::new()  # long-term baseline for relative degradation
 $lastSwapTime = [datetime]::MinValue
 $swapCooldown = 10
 $disconnectsSinceLastTrim = 0
+$inCluster = $false
+$clusterDisconnects = 0
+$lastClusterEnd = $null         # when the last cluster was considered over
 
 # --- Shared state for background ping threads ---
 # Each state holds a single .Value containing an immutable snapshot object.
@@ -80,39 +88,40 @@ $secondaryState = [hashtable]::Synchronized(@{
 })
 
 # --- Initialize log file ---
+$newHeader = "Timestamp,Adapter,IntervalSeconds,Prob,Jitter,Trend,Degraded,Cluster"
 if (-not (Test-Path $logFile)) {
-    "Timestamp,Adapter,IntervalSeconds,EMA_Seconds,Jitter,Trend,Degraded" | Out-File $logFile -Encoding UTF8
+    $newHeader | Out-File $logFile -Encoding UTF8
     Write-Host "Created log file: $logFile" -ForegroundColor DarkGray
 } else {
-    try {
-        $existing = Import-Csv $logFile
-    } catch {
-        Write-Host "Warning: could not parse log file, starting fresh: $_" -ForegroundColor Yellow
-        $existing = @()
+    # Migrate old CSV header if needed (EMA_Seconds -> Prob, add Cluster column)
+    $firstLine = (Get-Content $logFile -TotalCount 1)
+    if ($null -ne $firstLine -and $firstLine -match 'EMA_Seconds') {
+        $allLines = Get-Content $logFile
+        $allLines[0] = $newHeader
+        $allLines | Set-Content $logFile -Encoding UTF8
+        Write-Host "Migrated CSV header to new format" -ForegroundColor DarkGray
     }
-    if ($existing.Count -gt 0) {
-        foreach ($row in $existing) {
+    $lines = Get-Content $logFile -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne '' }
+    if ($null -ne $lines -and $lines.Count -gt 1) {
+        foreach ($line in ($lines | Select-Object -Skip 1)) {
             try {
-                $interval = [double]$row.IntervalSeconds
-                if ($interval -gt 0 -and $interval -ge $minStableInterval) {
+                $parts = $line -split ','
+                if ($parts.Count -lt 7) { continue }
+                $interval = [double]$parts[2]
+                if ($interval -gt 0 -and $interval -ge $minStableIntervalFloor) {
                     $intervals.Add($interval)
                 }
-                $lastDisconnectTime = [datetime]$row.Timestamp
-                $predictionBaseTime = $lastDisconnectTime
-                $lastEma = $row.EMA_Seconds
-                if ($lastEma -ne "" -and $null -ne $lastEma) {
-                    $emaInterval = [double]$lastEma
-                }
+                $lastDisconnectTime = [datetime]$parts[0]
+                # NOTE: Do NOT set $predictionBaseTime here — let the main loop set it
+                # when primary is actually observed healthy.
             } catch {
-                Write-Host "Skipping malformed log row: $($row | Out-String)" -ForegroundColor Yellow
+                Write-Host "Skipping malformed log row: $line" -ForegroundColor Yellow
                 continue
             }
         }
-        # If every row was malformed, lastDisconnectTime stays null — same as empty log
         if ($null -ne $lastDisconnectTime) {
             $count = $intervals.Count
-            $emaDisplay = if ($null -ne $emaInterval) { "$([math]::Round($emaInterval))s" } else { "(not set)" }
-            Write-Host "Loaded $count previous disconnects. EMA: $emaDisplay" -ForegroundColor DarkGray
+            Write-Host "Loaded $count previous disconnect intervals." -ForegroundColor DarkGray
         } else {
             Write-Host "Warning: no valid rows found in log, starting fresh" -ForegroundColor Yellow
         }
@@ -227,30 +236,31 @@ function Write-DisconnectLog($disconnectTime = $null) {
     # uptime cadence and excludes time spent on secondary.
     if ($null -ne $script:predictionBaseTime) {
         $interval = ($now - $script:predictionBaseTime).TotalSeconds
-    } elseif ($null -ne $script:lastDisconnectTime) {
+    } elseif ($null -ne $script:lastDisconnectTime -and $script:lastDisconnectTime -ge $script:scriptStartTime) {
         # Fallback for the very first disconnect after startup before any healthy transition
-        # has been observed.
+        # has been observed. Age guard: ignore if base timestamp predates script start.
         $interval = ($now - $script:lastDisconnectTime).TotalSeconds
     }
 
     $fed = $false
+    $currentMinStable = Get-MinStableInterval
     if ($interval -gt 0) {
-        if ($interval -ge $minStableInterval) {
-            # Feed stable intervals into the prediction dataset and EMA
+        if ($interval -ge $currentMinStable) {
+            # Feed stable intervals into the prediction dataset
             $script:intervals.Add($interval)
             # Trim to keep only the most recent entries — older data is still in the log file
             if ($script:intervals.Count -gt $maxIntervals) {
                 $script:intervals.RemoveRange(0, $script:intervals.Count - $maxIntervals)
             }
-            if ($null -eq $script:emaInterval) {
-                $script:emaInterval = $interval
-            } else {
-                $script:emaInterval = ($emaAlpha * $interval) + ((1 - $emaAlpha) * $script:emaInterval)
-            }
             $fed = $true
         } else {
-            Write-Host "  (bounce: ${interval}s < ${minStableInterval}s threshold, skipping EMA)" -ForegroundColor DarkGray
+            Write-Host "  (bounce: ${interval}s < ${currentMinStable}s threshold, skipping)" -ForegroundColor DarkGray
         }
+    }
+
+    # Update cluster detection state
+    if ($interval -gt 0) {
+        Update-ClusterState $interval
     }
 
     $script:lastDisconnectTime = $now
@@ -258,9 +268,9 @@ function Write-DisconnectLog($disconnectTime = $null) {
     # when primary next transitions to healthy, which disables prediction during the outage.
     $script:predictionBaseTime = $null
 
-    $emaStr = if ($null -ne $script:emaInterval) { [math]::Round($script:emaInterval) } else { "" }
+    $prob = if ($interval -gt 0) { [math]::Round((Get-DisconnectProbability $interval), 2) } else { "" }
     $deg = Get-LinkDegradation
-    "$($now.ToString('yyyy-MM-dd HH:mm:ss')),$primary,$([math]::Round($interval)),$emaStr,$($deg.Jitter),$($deg.Trend),$($deg.Degraded)" |
+    "$($now.ToString('yyyy-MM-dd HH:mm:ss')),$primary,$([math]::Round($interval)),$prob,$($deg.Jitter),$($deg.Trend),$($deg.Degraded),$($script:inCluster)" |
         Out-File $logFile -Append -Encoding UTF8
 
     $script:disconnectsSinceLastTrim++
@@ -278,70 +288,12 @@ function Write-DisconnectLog($disconnectTime = $null) {
         $avg = [math]::Round(($script:intervals | Measure-Object -Average).Average)
         $min = [math]::Round(($script:intervals | Measure-Object -Minimum).Minimum)
         $max = [math]::Round(($script:intervals | Measure-Object -Maximum).Maximum)
-        Write-Host "  LOGGED | Count: $count | Avg: ${avg}s | Min: ${min}s | Max: ${max}s | EMA: $([math]::Round($script:emaInterval))s" -ForegroundColor DarkYellow
+        Write-Host "  LOGGED | Count: $count | Avg: ${avg}s | Min: ${min}s | Max: ${max}s" -ForegroundColor DarkYellow
     }
 }
 
-function Get-PredictedDisconnectTime {
-    if ($script:intervals.Count -lt $minDataPoints -or $null -eq $script:emaInterval -or $null -eq $script:predictionBaseTime) {
-        return $null
-    }
-    return $script:predictionBaseTime.AddSeconds($script:emaInterval)
-}
-
-function Get-AdaptiveSafetyMargin {
-    if ($script:intervals.Count -lt $minDataPoints) {
-        return $safetyMarginPct
-    }
-    $mean = ($script:intervals | Measure-Object -Average).Average
-    if ($mean -le 0) { return $safetyMarginPct }
-
-    $sumSqDiff = 0
-    foreach ($v in $script:intervals) {
-        $sumSqDiff += ($v - $mean) * ($v - $mean)
-    }
-    $stddev = [math]::Sqrt($sumSqDiff / $script:intervals.Count)
-    $cv = $stddev / $mean
-
-    $margin = $safetyMarginPct * (1 + $cv)
-    return [math]::Min($margin, 0.40)
-}
-
-function Get-PredictiveSwapTime {
-    $predictedDisconnect = Get-PredictedDisconnectTime
-    if ($null -eq $predictedDisconnect) { return $null }
-    $adaptiveMargin = Get-AdaptiveSafetyMargin
-    $margin = $script:emaInterval * $adaptiveMargin
-    return $predictedDisconnect.AddSeconds(-$margin)
-}
-
-function Get-LinkDegradation {
-    if ($script:latencyWindow.Count -lt 5) {
-        return @{ Jitter = 0; Trend = 0; Degraded = $false }
-    }
-    $values = $script:latencyWindow.ToArray()
-    $n = $values.Count
-    $mean = ($values | Measure-Object -Average).Average
-
-    # Jitter = standard deviation of recent latencies
-    $sumSqDiff = 0
-    foreach ($v in $values) { $sumSqDiff += ($v - $mean) * ($v - $mean) }
-    $jitter = [math]::Sqrt($sumSqDiff / $n)
-
-    # Trend = linear regression slope (x = sample index, y = latency)
-    $sumX = 0; $sumY = 0; $sumXY = 0; $sumX2 = 0
-    for ($i = 0; $i -lt $n; $i++) {
-        $sumX += $i
-        $sumY += $values[$i]
-        $sumXY += $i * $values[$i]
-        $sumX2 += $i * $i
-    }
-    $denom = ($n * $sumX2) - ($sumX * $sumX)
-    $trend = if ($denom -ne 0) { (($n * $sumXY) - ($sumX * $sumY)) / $denom } else { 0 }
-
-    $degraded = ($jitter -gt $jitterThreshold) -or ($trend -gt $trendThreshold)
-    return @{ Jitter = [math]::Round($jitter, 1); Trend = [math]::Round($trend, 2); Degraded = $degraded }
-}
+# --- Shared helper functions (also used by tests) ---
+. "$PSScriptRoot\WifiFix-Functions.ps1"
 
 # --- Startup ---
 Write-Host "==========================================" -ForegroundColor Cyan
@@ -351,8 +303,9 @@ Write-Host "Primary:     $primary"
 Write-Host "Secondary:   $secondary"
 Write-Host "Ping mode:   ping.exe -S (async background threads)"
 Write-Host "Threshold:   ${latencyThreshold}ms | Failover: $failoverThreshold | Recovery: $recoveryThreshold"
-Write-Host "EMA alpha:   $emaAlpha | Safety margin: $($safetyMarginPct * 100)% base (adaptive)"
-Write-Host "Bounce:      ${minStableInterval}s min stable | Jitter: ${jitterThreshold}ms | Trend: ${trendThreshold}ms/tick"
+Write-Host "Prediction:  CDF swap=$($swapProbThreshold * 100)% return=P$($returnHoldPctile * 100) maxhold=${maxHoldTime}s"
+Write-Host "Bounce:      ${minStableIntervalFloor}s min stable (adaptive) | Jitter: ${jitterMultiplier}x baseline (floor ${minJitterThreshold}ms) | Trend: ${trendThreshold}ms/tick"
+Write-Host "Cluster:     ${clusterGapThreshold}s gap | ${clusterHoldMultiplier}x hold | ${clusterCooldownInterval}s cooldown"
 Write-Host "Min data:    $minDataPoints disconnects before prediction"
 Write-Host "Max log:     $maxLogLines entries | Max intervals: $maxIntervals"
 Write-Host "Log file:    $logFile"
@@ -403,9 +356,15 @@ try {
             if ($latencyWindow.Count -gt $latencyWindowSize) {
                 $latencyWindow.RemoveAt(0)
             }
+            # Long-term baseline for relative degradation thresholds
+            $baselineLatencyWindow.Add([double]$pResult.Latency)
+            if ($baselineLatencyWindow.Count -gt $baselineWindowSize) {
+                $baselineLatencyWindow.RemoveAt(0)
+            }
         }
         if (-not $pResult.Up) {
             $latencyWindow.Clear()
+            # NOTE: Do NOT clear $baselineLatencyWindow — baseline persists across brief outages
         }
 
         # --- Track up/down transitions for display ---
@@ -433,11 +392,11 @@ try {
         # --- Centralized disconnect detection ---
         # Log a disconnect the moment primary transitions from healthy to unhealthy,
         # regardless of which adapter is active or which swap path brought us here.
-        # Bounce filter: only log if primary was stably healthy (>= minStableInterval).
+        # Bounce filter: only log if primary was stably healthy (>= adaptive min stable).
         # Must run before $primaryHealthySince is cleared below.
         if ($previousTickHealthy -and -not $primaryHealthy) {
             if ($null -ne $primaryHealthySince -and
-                ($now - $primaryHealthySince).TotalSeconds -ge $minStableInterval) {
+                ($now - $primaryHealthySince).TotalSeconds -ge (Get-MinStableInterval)) {
                 Write-DisconnectLog $now
             }
         }
@@ -452,7 +411,7 @@ try {
         # periods are excluded from the "primary uptime before failure" measurement.
         if ($activeAdapter -eq $primary) {
             if ($primaryHealthy -and $null -ne $primaryHealthySince -and $null -eq $predictionBaseTime -and
-                ($now - $primaryHealthySince).TotalSeconds -ge $minStableInterval) {
+                ($now - $primaryHealthySince).TotalSeconds -ge (Get-MinStableInterval)) {
                 $predictionBaseTime = $now
             }
         }
@@ -481,14 +440,22 @@ try {
         }
 
         $totalUptime = [math]::Round(($now - $scriptStartTime).TotalSeconds)
-        $predictSwapAt = Get-PredictiveSwapTime
-        $predictDisconnectAt = Get-PredictedDisconnectTime
-        if ($null -ne $predictSwapAt) {
-            $secsUntilSwap = [math]::Round(($predictSwapAt - $now).TotalSeconds)
-            $marginPctDisplay = [math]::Round((Get-AdaptiveSafetyMargin) * 100)
-            $predictStr = "Swap in ${secsUntilSwap}s (~$(Get-Date $predictSwapAt -Format 'HH:mm:ss')) margin=${marginPctDisplay}%"
+        if ($null -ne $predictionBaseTime -and $intervals.Count -ge $minDataPoints) {
+            $elapsed = ($now - $predictionBaseTime).TotalSeconds
+            $prob = Get-DisconnectProbability $elapsed
+            $probPct = [math]::Round($prob * 100)
+            $predictStr = "P=${probPct}% elapsed=$([math]::Round($elapsed))s"
         } else {
-            $predictStr = "Learning"
+            $needed = $minDataPoints - $intervals.Count
+            $predictStr = if ($needed -gt 0) { "Learning ($needed more)" } else { "Waiting" }
+        }
+
+        $clusterStr = ""
+        if ($inCluster) {
+            $clusterStr = " [CLUSTER x$clusterDisconnects]"
+        } elseif ($null -ne $lastClusterEnd -and ($now - $lastClusterEnd).TotalSeconds -lt $clusterCooldownInterval) {
+            $remaining = [math]::Round($clusterCooldownInterval - ($now - $lastClusterEnd).TotalSeconds)
+            $clusterStr = " [POST-CLUSTER ${remaining}s]"
         }
 
         Write-Host -NoNewline "[$ts] "
@@ -496,13 +463,13 @@ try {
         Write-Host -NoNewline "S=$sTimeStr " -ForegroundColor $sColor
         Write-Host -NoNewline "Act=$activeAdapter " -ForegroundColor Cyan
         Write-Host -NoNewline "Total=${totalUptime}s " -ForegroundColor White
-        Write-Host "[$predictStr]" -ForegroundColor DarkYellow
+        Write-Host "[$predictStr]$clusterStr" -ForegroundColor DarkYellow
 
         # Show degradation warning when active on primary with enough data
         if ($activeAdapter -eq $primary -and $latencyWindow.Count -ge 5) {
             $deg = Get-LinkDegradation
             if ($deg.Degraded) {
-                Write-Host "  [DEGRADED jitter=$($deg.Jitter)ms trend=$($deg.Trend)ms/tick]" -ForegroundColor Yellow
+                Write-Host "  [DEGRADED jitter=$($deg.Jitter)ms(thr=$($deg.JitterThreshold)ms) trend=$($deg.Trend)ms/tick]" -ForegroundColor Yellow
             }
         }
 
@@ -522,44 +489,39 @@ try {
                         $primaryFails = 0
                         $primaryRecoveredCount = 0
                         $predictivelySwapped = $false
+                        $latencyWindow.Clear()
                     }
                 }
             } else {
                 $primaryFails = 0
             }
 
-            # === DEGRADATION-TRIGGERED EARLY SWAP ===
-            # If link quality is deteriorating and we're approaching a predicted disconnect, swap early
-            if (-not $predictivelySwapped -and $null -ne $predictDisconnectAt -and $activeAdapter -eq $primary) {
+            # === PREDICTIVE SWAP (CDF-based) ===
+            if (-not $predictivelySwapped -and $activeAdapter -eq $primary -and
+                $null -ne $predictionBaseTime -and $intervals.Count -ge $minDataPoints) {
+                $elapsed = ($now - $predictionBaseTime).TotalSeconds
+                $prob = Get-DisconnectProbability $elapsed
+
+                # Use a lower threshold if link degradation is detected
+                $threshold = $swapProbThreshold
                 $degradation = Get-LinkDegradation
                 if ($degradation.Degraded) {
-                    $earlyWindow = $script:emaInterval * $degradationLookaheadPct
-                    $earlySwapAt = $predictDisconnectAt.AddSeconds(-$earlyWindow)
-                    if ($now -ge $earlySwapAt -and $earlySwapAt -ge $scriptStartTime -and $sResult.Up -and $sResult.Latency -le $latencyThreshold) {
-                        $secsUntilDisconnect = [math]::Round(($predictDisconnectAt - $now).TotalSeconds)
-                        Write-Host "  DEGRADATION SWAP -> $secondary (jitter=$($degradation.Jitter)ms trend=$($degradation.Trend)ms/tick, disconnect in ~${secsUntilDisconnect}s)" -ForegroundColor Blue
-                        $result = Switch-To $secondary "degradation detected"
-                        if ($null -ne $result) {
-                            $activeAdapter = $result
-                            $predictivelySwapped = $true
-                            $savedPredictDisconnectAt = $predictDisconnectAt
-                            $latencyWindow.Clear()
-                        }
-                    }
+                    $threshold = $degradationProbThreshold
                 }
-            }
+                # Recently exited a cluster — lower threshold for earlier swap
+                if ($null -ne $lastClusterEnd -and ($now - $lastClusterEnd).TotalSeconds -lt $clusterCooldownInterval) {
+                    $threshold = [math]::Min($threshold, $degradationProbThreshold)
+                }
 
-            # === PREDICTIVE SWAP ===
-            # Only act on predictions in the future — ignore stale windows from before startup
-            if (-not $predictivelySwapped -and $null -ne $predictSwapAt -and $activeAdapter -eq $primary) {
-                if ($now -ge $predictSwapAt -and $predictSwapAt -ge $scriptStartTime -and $sResult.Up -and $sResult.Latency -le $latencyThreshold) {
-                    $secsUntilDisconnect = [math]::Round(($predictDisconnectAt - $now).TotalSeconds)
-                    Write-Host "  PREDICTIVE SWAP -> $secondary (predicted disconnect in ~${secsUntilDisconnect}s)" -ForegroundColor Blue
-                    $result = Switch-To $secondary "predictive"
+                if ($prob -ge $threshold -and $sResult.Up -and $sResult.Latency -le $latencyThreshold) {
+                    $probPct = [math]::Round($prob * 100)
+                    $reason = if ($degradation.Degraded) { "predictive+degraded P=${probPct}%" } else { "predictive P=${probPct}%" }
+                    Write-Host "  PREDICTIVE SWAP -> $secondary ($reason)" -ForegroundColor Blue
+                    $result = Switch-To $secondary $reason
                     if ($null -ne $result) {
                         $activeAdapter = $result
                         $predictivelySwapped = $true
-                        $savedPredictDisconnectAt = $predictDisconnectAt
+                        $latencyWindow.Clear()
                     }
                 }
             }
@@ -581,10 +543,10 @@ try {
                         $secondaryFails = 0
                         $primaryRecoveredCount = 0
                         $primaryUpSince = $now
-                        # Re-anchor prediction base so the stale window doesn't re-trigger
-                        if ($predictivelySwapped) {
-                            $script:predictionBaseTime = $now
-                        }
+                        # Let the main loop re-anchor predictionBaseTime after the
+                        # bounce debounce is satisfied, rather than setting it here
+                        # where primary may not have been healthy long enough.
+                        $script:predictionBaseTime = $null
                         $predictivelySwapped = $false
                     }
                 }
@@ -595,7 +557,15 @@ try {
             # Swap back to primary once it recovers (sustained good pings)
             if (-not $predictivelySwapped -and $pResult.Up -and $pResult.Latency -le $latencyThreshold) {
                 $primaryRecoveredCount++
-                if ($primaryRecoveredCount -ge $recoveryThreshold) {
+                # During a cluster or shortly after one, require more recovery evidence
+                $effectiveThreshold = $recoveryThreshold
+                if ($inCluster) {
+                    $effectiveThreshold = $recoveryThreshold * $clusterHoldMultiplier
+                } elseif ($null -ne $lastClusterEnd -and ($now - $lastClusterEnd).TotalSeconds -lt $clusterCooldownInterval) {
+                    # Recently exited a cluster — use intermediate threshold
+                    $effectiveThreshold = [math]::Ceiling($recoveryThreshold * 1.5)
+                }
+                if ($primaryRecoveredCount -ge $effectiveThreshold) {
                     Write-Host "  FAILBACK -> $primary (primary recovered)" -ForegroundColor Magenta
                     $result = Switch-To $primary "failback - primary recovered"
                     if ($null -ne $result) {
@@ -610,33 +580,32 @@ try {
                 $primaryRecoveredCount = 0
             }
 
-            # Predictive return - wait past the disconnect window then return
-            if ($predictivelySwapped -and $pResult.Up -and $pResult.Latency -le $latencyThreshold) {
-                $waitTime = $emaInterval * (Get-AdaptiveSafetyMargin) * 2
-                $returnAfter = $savedPredictDisconnectAt.AddSeconds($waitTime)
-                if ($now -gt $returnAfter) {
-                    # Print explanation before Switch-To so message ordering is logical.
-                    # If Switch-To returns $null (cooldown), the message still shows — this is
-                    # informative as it indicates a return was attempted but suppressed.
-                    Write-Host "  PREDICTIVE RETURN -> $primary (disconnect window passed)" -ForegroundColor Blue
+            # === PREDICTIVE RETURN (CDF-based) ===
+            if ($predictivelySwapped -and $null -ne $predictionBaseTime -and $pResult.Up -and $pResult.Latency -le $latencyThreshold) {
+                $elapsed = ($now - $predictionBaseTime).TotalSeconds
+                $returnAfterInterval = Get-IntervalPercentile $returnHoldPctile
+
+                # During a cluster, extend the hold time
+                if ($inCluster -and $null -ne $returnAfterInterval) {
+                    $returnAfterInterval = $returnAfterInterval * $clusterHoldMultiplier
+                }
+
+                $holdExpired = ($null -ne $returnAfterInterval -and $elapsed -gt $returnAfterInterval)
+                $effectiveMaxHold = if ($inCluster) { $maxHoldTime * $clusterHoldMultiplier } else { $maxHoldTime }
+                $hardTimeout = ($now - $lastSwapTime).TotalSeconds -gt $effectiveMaxHold
+
+                if ($holdExpired -or $hardTimeout) {
+                    $reason = if ($hardTimeout) { "max hold time" } else { "disconnect window passed" }
+                    if ($inCluster) { $reason += " (cluster)" }
+                    Write-Host "  PREDICTIVE RETURN -> $primary ($reason)" -ForegroundColor Blue
                     $result = Switch-To $primary "predictive return"
                     if ($null -ne $result) {
                         if ($null -eq $script:predictionBaseTime) {
                             # A disconnect was logged during the window (Write-DisconnectLog
                             # nulls predictionBaseTime). Reset uptime anchor.
                             $primaryUpSince = $now
-                        } else {
-                            # False positive — primary stayed healthy the whole window.
-                            $observedInterval = ($now - $script:predictionBaseTime).TotalSeconds
-                            if ($null -ne $script:emaInterval -and $observedInterval -gt $script:emaInterval) {
-                                $script:emaInterval = ($emaAlpha * $observedInterval) + ((1 - $emaAlpha) * $script:emaInterval)
-                                Write-Host "  (false positive, EMA nudged to $([math]::Round($script:emaInterval))s)" -ForegroundColor DarkGray
-                            } else {
-                                Write-Host "  (no disconnect observed, skipping log)" -ForegroundColor DarkGray
-                            }
-                            # Leave $primaryUpSince alone so the display reflects real uptime.
                         }
-                        # Re-anchor prediction base so next window is in the future
+                        # Re-anchor prediction base for next window
                         $script:predictionBaseTime = $now
                         $activeAdapter = $result
                         $primaryRecoveredCount = 0
