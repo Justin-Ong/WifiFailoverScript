@@ -19,6 +19,7 @@ $swapProbThreshold = 0.65      # swap when this fraction of historical disconnec
 $returnHoldPctile = 0.90       # stay on secondary until elapsed time exceeds this percentile of intervals
 $maxHoldTime = 180             # hard ceiling on secondary hold time (seconds)
 $degradationProbThreshold = 0.40 # lower swap threshold when link degradation is detected
+$predictionWindowSize = 20     # number of recent intervals to use for CDF (0 = use all)
 $minDataPoints = 3             # minimum disconnects before enabling prediction
 $staleProbeThreshold = 10      # seconds — treat probe as down if Updated is older than this
 $minStableIntervalFloor = 8    # absolute minimum — adaptive threshold won't go below this
