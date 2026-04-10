@@ -23,7 +23,7 @@ $max = $sorted[-1]
 Write-Host "=== Interval Statistics ===" -ForegroundColor Cyan
 Write-Host ("  Mean:   {0:N1}s" -f $mean)
 Write-Host ("  Median: {0:N1}s" -f $median)
-Write-Host ("  Min:    {0:N1}s  Max: {0:N1}s" -f $min, $max)
+Write-Host ("  Min:    {0:N1}s  Max: {1:N1}s" -f $min, $max)
 Write-Host ""
 
 # --- Distribution buckets ---
